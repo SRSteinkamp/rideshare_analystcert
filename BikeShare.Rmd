@@ -1,0 +1,313 @@
+---
+title: "Bikes Share (Capstone)"
+output: html_notebook
+---
+
+# Personal Background
+During my job-search and some downtime I started the Google Data Analytics Certificate, 
+more or less for fun, so here is the fictional capstone project. 
+
+
+# Report on Bicycle Usage by Members and Non-Members
+
+
+## Goal
+Use bike usage data to inform the marketing team on how to lead to a better conversion from casual users to annual members.
+
+Questions that needs to be addressed:
+
+* Are there different usage patterns, do casual members use bikes more on weekdays or weekends?
+* How are bikes used (round-trip or one-way)?
+* Do casual and annual members differ in terms of trip-durations?
+
+## Data Sources
+The data has been provided by divvy bikes [here](https://divvy-tripdata.s3.amazonaws.com/index.html), under [this](https://www.divvybikes.com/data-license-agreement) license. 
+
+The data is not connected to the fictional company the report is for, but let's pretend it is. Data description in the capstone protocol are outdated, so certain questions cannot be addressed as for example individual identifiers have been removed over time. 
+
+Furthermore, usage patterns of the last 12 months (which are the most actual) might not represent actual use, due to the COVID-19 pandemic. 
+
+Possible changes due to the pandemic:
+
+* Lockdowns (i.e. less bike use)
+* Higher use of bikes, to avoid public transportation
+
+To not save the data in the repository, I have written a small bash script (`getdata.sh`) to create the `data` folder and download the monthly `.csv` files from the resource into it. Data from April 2020 to April 2021 will be retrieved. 
+
+The `data` folder will also be used to store cleaned and aggregate data files.
+
+## Data Preprocessing
+
+```{r, echo=FALSE}
+# Found this nice blogpost on efficiently / loading and installing packages
+# https://statsandr.com/blog/an-efficient-way-to-install-and-load-r-packages/#inefficient-way-to-install-and-load-r-packages
+# Libraries
+# Package names
+packages <- c("ggplot2", "scales", "tidyverse",  "broom", "jtools", "data.table", "lubridate")
+
+# Install packages not yet installed
+installed_packages <- packages %in% rownames(installed.packages())
+if (any(installed_packages == FALSE)) {
+  install.packages(packages[!installed_packages])
+}
+
+# Packages loading
+invisible(lapply(packages, library, character.only = TRUE))
+```
+
+I downloaded the monthly files, so we need to get a quick overlook over the
+columns and structures and, if necessary adapt column names etc.
+
+To make the whole calculation a bit more efficient, I am already transforming
+dates to datetime and drop a few unneeded columns.
+
+Additionally, I am also creating summary tables for each month to have a few
+consistency checks.
+```{r}
+files = dir(path="data/", pattern = glob2rx("20*.csv"))
+
+dataframes = list()
+controls = list()
+
+c <- 1
+
+for (fname in files){
+    print(fname)
+    # All ready reduce the amount of data in the loaded data, to keep things clean,
+    # for validation also change dates to datetime
+    dataframes[[c]] <- fread(paste('data/', fname, sep=''), sep=',',
+                             select=c('ride_id', 'started_at', 'ended_at', 'member_casual',
+                                      'start_station_name', 'end_station_name')) %>%
+        mutate(started_at = as_datetime(started_at), ended_at = as_datetime(ended_at))
+
+    # Do some consistency checks
+    controls[[c]] <- summarise(dataframes[[c]], min_s = min(started_at), max_s = max(started_at), 
+                                     min_e = min(ended_at), max_e = max(ended_at), 
+                                     member = n_distinct(member_casual),
+                                     stations = n_distinct(start_station_name),
+                                     n = n())
+    c <- c + 1
+}
+
+```
+
+```{r}
+bind_rows(controls)
+```
+
+There are a few suspiciously long end dates for rides and possibly a few datapoints
+missing in early June 2020. So we need to see what will happen there.
+Also in May and June rides are heavily increasing as compared to April (pandemic?).
+
+
+```{r}
+# Combine data and save, so we can load a single df.
+whole <- bind_rows(dataframes)
+write_csv(whole, 'data/wholedata.csv')
+```
+
+```{r}
+# Now do a few calculations, which we will need for further uses and analysis.
+
+data <- whole %>%
+  mutate(month = month(started_at, label=TRUE),
+         date = date(started_at),
+         day = day(started_at),
+         year = year(started_at),
+         day_of_week = wday(whole$started_at, label=TRUE),
+         start_station_name = as.character(start_station_name),
+         end_station_name = as.character(end_station_name))
+
+data$tripduration <- as.numeric(difftime(whole$ended_at, whole$started_at))
+data$samestation <- data$start_station_name == data$end_station_name
+```
+
+Now, also given the data, a bit of data cleaning has still to be performed. 
+There are negative values, and a few very, very long times (let's keep them in first).
+
+```
+The data has been processed to remove trips that are taken by staff as they service and inspect the system; and any trips that were below 60 seconds in length (potentially false starts or users trying to re-dock a bike to ensure it was secure).
+```
+
+But according to the new information, we do not need to remove service trips, so there appears to be some data cleaning which had already been done.
+
+Unfortunately - there are still some testing stations in there, which will now be removed.
+
+```{r}
+# Remove negative trips and testing stations (as well as missing data)
+test_stations <- c("hubbard_test_lws", "WATSON TESTING - DIVVY", "", 
+                   "HUBBARD ST BIKE CHECKING (LBS-WH-TEST)")
+data_clean <- filter(data, tripduration > 60) %>%
+  filter(! start_station_name %in% test_stations, 
+         !end_station_name %in% test_stations)
+
+write_csv(data_clean, 'data/clean_data.csv')
+```
+
+## Analysis and Visualization
+
+```{r}
+# Read data directly, to save time.
+data <- fread('data/clean_data.csv')
+```
+
+To keep this project a bit more simple, I will summarize the data in terms of descriptive statistics and rely on simple generalized linear models to come to conclusions. 
+
+### First show a summary of the data
+```{r}
+summary(data %>% 
+          select(member_casual, month, day_of_week, tripduration, samestation) %>% 
+          mutate(tripduration = tripduration / 60))
+```
+
+We see here in the `member_casual` column, that more trips have been conducted by subscribers, than by casual members, that the most trips have been done on Saturdays, that August and July have had the highest usage in general. That the average trip duration is about 27 minutes and the median duration 15. The distribution is heavily skewed, as there are a few very long trips in the dataset, that do not appear to be noise. I would assume that these heavy users rented the bike for a whole month, though there is the possibility, that something during check-out went wrong. 
+
+### Statistical analysis
+The first question I want to address here is whether week-days and membership status have a significant influence on trip duration.
+
+```{r}
+data <- mutate(data, tripduration_min = tripduration / 60)
+
+tripduration_model <- glm(tripduration_min ~ day_of_week * member_casual, data=data)
+
+summ(tripduration_model)
+```
+
+For the analysis of round trips versus one way trips, I will rely on summary statistics.  
+```{r}
+data %>% 
+  group_by(member_casual, day_of_week) %>% 
+  summarise(Proportion = round(mean(samestation) * 100, 2))
+```
+
+What we see, is that members mostly do one-way trips, whereas casual rides do round-trips.
+
+```{r}
+data %>% 
+  group_by(member_casual, samestation) %>% 
+  summarise("Median Tripduration" = median(tripduration_min))
+```
+
+Looking at median trip durations for members and one-way and round trips, we see that round-trips are about twice as long. And again longer for casual users than for members. 
+
+Finally, let's look at differences in riding behavior.
+```{r}
+data %>%
+  group_by(member_casual, day_of_week) %>%
+  summarise(n = n()) %>%
+  mutate(Proportion = round(100 * (n / sum(n)), 2))
+```
+
+Here we also see a trend in that casual riders use bikes more often on the weekends, whereas members do not appear to have strong differences in weekly riding. 
+
+
+# Report / Conclusions
+
+## Our population: 
+```{r, echo=FALSE}
+# From http://www.sthda.com/english/wiki/ggplot2-pie-chart-quick-start-guide-r-software-and-data-visualization
+
+blank_theme <- theme_minimal()+
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.border = element_blank(),
+  panel.grid=element_blank(),
+  axis.ticks = element_blank(),
+  plot.title=element_text(size=14, face="bold")
+  )
+
+pie <- data %>% 
+  group_by(member_casual) %>%
+  summarise(Numbers = n()) %>%
+  mutate(Proportion = round(100 * (Numbers / sum(Numbers)), 2)) %>%
+  rename(Membership = member_casual) %>%
+  ggplot(aes(x="", y=Proportion, fill=Membership)) +
+  geom_bar(width = 1, stat = "identity") + 
+  blank_theme +
+  coord_polar("y", start=0) +
+  theme(axis.text.x=element_blank()) +
+  geom_text(aes(y = Proportion / 2 + c(0, cumsum(Proportion)[-length(Proportion)]), 
+    label = percent(Proportion / 100)), size=5) +
+  labs(title='Proportion of Rides for Members and Casual Riders',
+       subtitle='Data from April 2020 to April 2021, based on the divvy rides dataset.')
+
+pie
+```
+
+First of all, we see that in the last 12 months, there have been many more rides by members than by casual users. 
+
+However, due to data privacy, we cannot say how many riders we have so this dataset is incomplete in this regard.
+
+## Rides during the Week
+
+
+```{r, echo=FALSE}
+week_rides <- data %>%
+  group_by(member_casual, day_of_week) %>%
+  summarise(n = n()) %>%
+  mutate(Proportion = round( (n / sum(n)), 2))
+
+pie2 <- week_rides %>% 
+  rename(Membership = member_casual,
+         Day = day_of_week) %>%
+  ggplot(aes(x=factor(Day, level=c('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')), y=Proportion)) +
+  geom_bar(stat="identity", aes(fill=Membership),  position=position_dodge(width=0.9)) + 
+  blank_theme + 
+  labs(title='Proportion of Rides Based on Day of the Week',
+       subtitle='Casual riders use the services more often on the weekend, members use it throughout.')
+
+pie2
+```
+
+```{r, echo=FALSE}
+data %>% 
+  group_by(member_casual, day_of_week) %>% 
+  summarise(Proportion = round(mean(samestation) * 100, 2)) %>%
+  rename(Membership = member_casual,
+         Day = day_of_week) %>%
+  ggplot(aes(x=factor(Day, level=c('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')), y=Proportion)) +
+  geom_bar(stat="identity", aes(fill=Membership),  position=position_dodge(width=0.9)) + 
+  blank_theme + 
+  labs(title='Proportion of Round-Trips During the Week',
+       subtitle='Casual riders use bikes more for roundtrips.')
+
+
+```
+
+Further interesting observations in terms of biking behavior are:
+
+* Casual members use bikes more often on the weekends
+* Members use bikes throughout the week
+* Casual members use bikes more often for round trips
+* Members do one-way trips 
+
+
+## Trip durations
+
+```{r, echo=FALSE}
+data %>% 
+  rename(Membership = member_casual,
+         Day = day_of_week) %>%
+  filter(tripduration_min < quantile(tripduration_min, 0.95)) %>%
+  ggplot(aes(x=factor(Day, level=c('Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So')), y=tripduration_min)) +
+  geom_boxplot(aes(fill=Membership)) + 
+  theme_minimal() + 
+  labs(title='Trip Duration of Rides Based on Day of the Week',
+       subtitle='Trip duration was capped at the 95th percentile, as distributions are heavily skewed to the left.',
+       y='Trip Duration in Minutes',
+       x="")
+
+```
+
+The graphic shows, also referring to our GLM analysis above, that casual rides do longer rides
+and that rides during the weekend are generally longer.
+
+
+# Conclusion and Advice
+
+In my opinion given the data and having some experience in using bike-shares, I think the marketing team could consider the following three points to convert casual riders to annual riders:
+
+* Cater to the great network of stations and explain that using bikes for shorter trips is definitely worth it. As a member you do not need to carry your bike with you all day, you can change it just like that.
+* Especially during the pandemic: The network of bike stations is a healthier alternative to public transportation. It can also be used for the customers commute.
+* More generally: Stress that an annual subscription is cheaper and reduces stress, as you can always chose a bike, whererver you want and do your next trip with it - Not only on the weekend but also for commutes or grocery shopping during the week. 
